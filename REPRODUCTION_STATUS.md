@@ -161,3 +161,271 @@ Interpretation (preliminary): selecting *similar* videos within a task yields a 
    (38 GB) would use 5 % of our disk budget. Deferred until we actually need
    to run multimodal eval; the SFT JSON (`sft_all8_answer_only.json`,
    20 MB) is already in `data/syncr/train/`.
+
+---
+
+# Part II — Baseline paper reproductions
+
+Separate workstream from the ACVCL testbed above; the Part I material is
+unchanged. Work lives under `reproductions/{data_selection,visual_debiasing,robot_learning}/`,
+external code under `third_party/` (untracked), environments in
+[`ENVIRONMENTS.md`](ENVIRONMENTS.md), logging in [`WANDB_SETUP.md`](WANDB_SETUP.md).
+
+Cluster context: Slurm job 60385 on `worker-mig-3g40gb-0`, 16 CPU, 64 GB RAM,
+1× H100 MIG 3g.40gb, 10 h walltime. All experiments run **sequentially** — one
+heavy job on the slice at a time, per `RULE.md` §2.
+
+## II.0 Summary — what ran, what it produced
+
+One 10 h allocation, seven papers attempted, all runs sequential on one MIG
+slice. W&B project `acvcl-reproduction` (entity `hust_edu_vn`) holds every run.
+
+| # | paper | dataset | headline reproduced number | label |
+|---|---|---|---|---|
+| 1 | **GLISTER** (AAAI'21) | CIFAR-10 @ 10 % | 91.30 % test acc | faithful |
+| 1 | **GradMatch** (ICML'21), PB variant | CIFAR-10 @ 10 % | 92.27 % test acc | faithful |
+| — | Random subset baseline | CIFAR-10 @ 10 % | 75.49 % test acc | faithful |
+| 2 | **Correct-N-Contrast** (ICML'22) | Waterbirds | 88.72 % worst-group (val, best-of-evals) | partial — reproducibly SIGKILLed |
+| 3 | **Learning from Failure** (NeurIPS'20) | Colored MNIST 99 % | 70.20 % unbiased acc vs 46.38 % ERM | modified |
+| 4 | **Let Samples Speak** (CVPR'25) | Waterbirds | 87.38 % worst-group / 95.74 % mean | partial |
+| 5 | **ACT** | aloha_sim_insertion_human | 10 % task success @ 15 k steps | partial |
+| 6 | **Diffusion Policy** | pusht | 40 % task success @ 15 k steps | partial |
+| 7 | **SOAR** (ICCV'23) | UCF101 | not started | blocked — no allocation time left |
+
+The strongest results are the data-selection pair, where both methods beat a
+random subset of the same size by ~16 pp and the whole comparison ran at the
+papers' own published configs. The debiasing group all produced the qualitative
+effect each paper claims. The two robot policies trained and evaluated in
+simulation but at 15 % of the reference step budget, so their success rates are
+lower bounds, not reproductions.
+
+Nothing here should be read as matching a published figure unless this document
+says so explicitly — see §II.3 for the per-row caveats and §II.5 for four bugs
+in the published code that had to be fixed before anything would run.
+
+## II.1 Reproduction fidelity labels
+
+| label | meaning |
+|---|---|
+| **faithful** | official config + official data + official metric, unmodified |
+| **modified** | official config, but something had to change (noted per row) |
+| **partial** | ran, but fewer epochs/seeds or a subset of the paper's grid |
+| **smoke** | pipeline verified end-to-end, result not meaningful |
+| **blocked** | could not run; reason recorded |
+
+## II.2 Dataset provenance
+
+Every original host below was checked from the compute node first. The
+approved sources are HF / Google Drive / GitHub / PyPI.
+
+| dataset | original host | status | source used | size |
+|---|---|---|---|---|
+| CIFAR-10 | `cs.toronto.edu` | **blocked** (000) | HF `uoft-cs/cifar10` | ~150 MB |
+| Waterbirds | `nlp.stanford.edu` | **blocked** (000) | HF `grodino/waterbirds` | 412 MB → 473 MB on disk |
+| MNIST (→ Colored MNIST) | `yann.lecun.com` | **blocked** (000) | `ossci-datasets.s3.amazonaws.com` (torchvision mirror 2) | 64 MB |
+| Tiny ImageNet | `cs231n.stanford.edu` | **blocked** (000) | HF `zh-plus/tiny-imagenet` (not yet pulled) | ~240 MB |
+| Food-101 | — | available | HF `ethz/food101` (not yet pulled) | ~5 GB |
+| CnC pretrained ERM | Google Drive | available | `gdown` folder, Waterbirds files only | 283 MB |
+
+Verification done before use, not assumed:
+
+- CIFAR-10: 50 000 train / 10 000 test, 10 classes, exactly 5 000 and 1 000
+  per class, 32×32 RGB.
+- Waterbirds: 4 795 / 1 199 / 5 794 and per-group counts
+  `(landbird,land)=3498, (landbird,water)=184, (waterbird,land)=56, (waterbird,water)=1057`
+  on train — identical to the published 95 %-correlation split. The HF parquet
+  carries the original JPEG bytes and filenames, so
+  `reproductions/visual_debiasing/prep_waterbirds.py` rebuilds the
+  `waterbird_complete95_forest2water2/` tree byte-for-byte and refuses to write
+  if the group counts disagree.
+- Colored MNIST: 60 000 train at **99.00 %** bias-aligned (skew 0.01) and
+  10 000 validation at **10.00 %** — matches LfF's protocol.
+
+Waterbirds is built once and symlinked into both `correct-n-contrast` and
+`nsf_debiasing`; MNIST is shared between CnC and LfF. No dataset is duplicated.
+
+## II.3 Results
+
+CIFAR-10 / ResNet18 / fraction 0.1, official CORDS configs (SGD lr 0.05,
+momentum 0.9, nesterov, wd 5e-4, cosine `T_max`=300, 300 epochs, batch 128).
+
+| method | select_every | test acc (final / best) | wall | selection overhead | GPU peak | label |
+|---|---|---|---|---|---|---|
+| **GLISTER** | 20 | 91.30 % / 91.30 % | 884 s | 146 s (16.5 %) | 4.2 GB | faithful |
+| **GradMatchPB** | 1 | **92.27 % / 92.36 %** | 2 564 s | 1 825 s (71.2 %) | 4.2 GB | faithful |
+| Random (baseline) | 1 | 75.49 % / 75.59 % | 738 s | 0.4 s (0.06 %) | 4.1 GB | faithful |
+
+Both selection methods beat random subset selection by a wide margin at the
+same 10 % budget — **+15.8 pp** (GLISTER) and **+16.8 pp** (GradMatchPB) — which
+is the qualitative claim of both papers, and GLISTER's 91.3 % sits in the
+~90–91 % band the AAAI'21 paper and the CORDS benchmark report for this setting.
+
+The cost side is worth recording separately: the two methods are nearly tied on
+accuracy (0.97 pp apart) but not on price. GradMatchPB's shipped config
+re-selects **every** epoch (299 selections, 71 % of wall time) against GLISTER's
+every 20th (15 selections, 17 %), so GradMatchPB spends 2.9× the wall clock for
+its ~1 pp edge. Random costs essentially nothing to select and loses ~16 pp.
+
+Not run: the full-data (100 %) reference and AdaptiveRandom, and the Tiny
+ImageNet / Food-101 adaptations — deprioritised to reach the other five papers
+within one 10 h allocation. CORDS has no Food-101 branch, so that one needs a
+new dataset branch rather than just a config.
+
+### Visual debiasing
+
+| paper | dataset | metric | reproduced | label |
+|---|---|---|---|---|
+| **Learning from Failure** (NeurIPS'20) | Colored MNIST, skew 0.01 / sev 4 | unbiased val acc | **70.20 %** (best 71.11 %) | modified |
+| ERM baseline for the above | same | unbiased val acc | **46.38 %** | modified |
+| **Let Samples Speak** (CVPR'25) — full `ssc.py` | Waterbirds | worst-group / mean | **87.38 % / 95.74 %** | partial |
+| its ERM pre-training stage | Waterbirds | worst-group / mean | **74.92 % / 89.94 %** | partial |
+| **Correct-N-Contrast** (ICML'22) | Waterbirds | worst-group (val) | **88.72 % best observed** | partial |
+
+LfF reproduces the paper's central claim cleanly: the biased model collapses
+onto the colour shortcut (100 % on bias-aligned, 8.4 % on bias-conflicting) and
+the debiased model lands at 70.2 % unbiased — **+23.8 pp over its own ERM
+baseline**. It is labelled *modified* only because it runs on torch 2.4 rather
+than the paper's torch 1.4.
+
+**Let Samples Speak** is the cleanest of the three on Waterbirds: the full
+`ssc.py` pipeline ran to completion (exit 0) and lifts worst-group accuracy
+from its own ERM base's 74.92 % to **87.38 %, +12.46 pp**, while mean accuracy
+rises 89.94 % → 95.74 %. Per-group: 96.72 / 98.14 / 92.21 / 87.38 %. Note the
+worst group after debiasing is (waterbird, water) — a *majority* group — not the
+rare (waterbird, land) group, which reached 92.21 %: the method traded majority
+headroom for minority robustness, which is the intended behaviour.
+
+It is labelled **partial** for one specific reason: its ERM base was trained
+30 epochs instead of the official 100, so the 87.38 % rests on a shorter
+pre-training run than the paper's. The paper reports >20 pp worst-group gain
+over ERM; we measure +12.46 pp over *our* 30-epoch ERM, which is not the same
+comparison and should not be read as agreeing or disagreeing with it.
+
+**Correct-N-Contrast** did not finish, and the failure is reproducible in a way
+worth recording. Its first attempt died on the repo bug below (§II.5). After
+that was fixed, two further attempts were **SIGKILLed (exit 137)** — not the
+wall-clock bound, which returns 124 and which neither run reached:
+
+| attempt | `batch_factor` | elapsed before kill | eval passes reached | exit |
+|---|---|---|---|---|
+| 2 | 32 (official) | ~56 min | 17 | 137 |
+| 3 | 12 (reduced per `RULE.md` §2) | ~56 min | 17 | 137 |
+
+Cutting `batch_factor` to a third changed **nothing** — same signal, same
+elapsed time, same stage. So the cause is not the contrastive batch size, and
+reducing it further is not the fix: something allocates a large, roughly
+fixed amount at the stage reached after 17 evaluation passes and runs into the
+job's 64 GB ceiling. Diagnosing which allocation needs another ~1 h run with
+memory instrumentation, which the allocation had no room for. Recorded as a
+**reproducible blocker**, not as solved.
+
+Consequently 88.72 % is the best
+worst-group accuracy seen across evaluation passes, not a completed run's
+selected checkpoint, and it is the **validation** split — CnC's
+`evaluate_model` is called with `[train_loader, val_loader]` and keeps the last
+loader — whereas the paper's headline 88.5 % is test worst-group. Two
+independent runs both peaked at exactly 88.72 %, which is reassuring, but
+"best over evals" is a more generous selection rule than the paper's and the
+splits differ, so **this is not a reproduction of the published number**.
+
+### Robot learning
+
+Both trained from **RGB observations** (the datasets' camera features), in the
+separate `lerobot` env, with lerobot's own policy defaults; only the step count
+was cut — from lerobot's 100 k default to 15 k — to fit the allocation. Both are
+therefore **partial** by construction, at 15 % of the reference budget.
+
+| policy | dataset | steps (of 100 k) | train loss | task success | eval | GPU peak | label |
+|---|---|---|---|---|---|---|---|
+| **ACT** | `lerobot/aloha_sim_insertion_human` | 15 000 (4.8 ep) | 0.1147 (l1 0.0953, kld 0.0019) | **10 %** | 10 ep, AlohaInsertion-v0 | 2.1 GB | partial |
+| **Diffusion Policy** (+EMA) | `lerobot/pusht` | 15 000 (37.4 ep) | 0.0084 | **40 %** | 10 ep, PushT | 6.0 GB | partial |
+
+Success is `eval/pc_success` from lerobot's own simulator rollouts, so these are
+real policy evaluations, not training proxies. `gym_aloha` and `gym_pusht` both
+run here under `MUJOCO_GL=osmesa`, because MIG mode disables NVIDIA EGL.
+
+**These numbers must not be read as reproducing the published ones.** At 15 % of
+the training budget they are lower bounds on what the full recipes reach, and
+the published figures for these two settings were not re-verified from the
+papers during this session, so no claim of agreement is made either way. The
+honest statement is: the pipelines train, evaluate in simulation, and produce
+plausible partial-budget success rates (DP's 40 % on PushT after 37 epochs,
+ACT's 10 % on the harder insertion task after 4.8 epochs).
+
+## II.4 Deviations from the published setups
+
+1. **Data sources** — the three blocked hosts above forced HF mirrors. Content
+   was verified identical (counts, per-class/per-group sizes, and for
+   Waterbirds the original bytes), so this changes provenance, not data.
+2. **CORDS loader shim** — `torchvision.datasets.CIFAR10` would still try to
+   reach `cs.toronto.edu` and fails its md5 check on any locally rebuilt copy,
+   so `reproductions/data_selection/cords_compat.py` substitutes an
+   HF-backed class with the same `.targets` / `transform` semantics.
+   Training code, config and splits are untouched.
+3. **CORDS `print_args`** — adding `subtrn_loss` to the official print list
+   crashes `train_sl.py` (`subtrn_losses[-1]` on an empty list), so each
+   config's own `print_args` is used unchanged.
+4. **nsf_debiasing `train_sup.sh` is not used.** It picks a GPU by scanning
+   `nvidia-smi` output, overrides `CUDA_VISIBLE_DEVICES`, and launches
+   `nohup … &` detached processes — all three conflict with `RULE.md` §2/§4 on
+   a shared Slurm node. `train_supervised.py` is invoked directly with the
+   same hyperparameters the script would have passed. Its
+   `--label_filename` flag is also dropped: that argument belongs to
+   `ssc.py`'s parser, not `train_supervised.py`'s.
+5. **LfF runs on modern torch.** The repo pins torch 1.4 / numpy 1.18 /
+   sklearn 0.21, none of which support an H100. It runs unmodified on torch
+   2.4.1 apart from import shims (`wand`, needed only by the Corrupted
+   CIFAR-10 protocol we do not use) and `server_user`'s paths, which the repo
+   marks as user configuration. Numerical results may therefore differ
+   slightly from the paper's torch 1.4 runs → labelled **modified**.
+6. **`setuptools<81`** is pinned in the env because `sacred` (LfF's config
+   system) imports `pkg_resources`.
+7. **`mmcv` is stubbed, not installed.** `nsf_debiasing/ssc_common.py` imports
+   mmcv (absent from its README requirements) and uses exactly one symbol from
+   it, `mmcv.ProgressBar`, in three places. A tqdm-style stand-in with the same
+   API is in `reproductions/visual_debiasing/nsf_compat.py`; installing the
+   OpenMMLab package, which builds CUDA ops against a pinned torch, would have
+   been disproportionate.
+8. **lerobot's torch is downgraded to 2.8.0+cu128.** `pip install lerobot`
+   pulls torch 2.11, whose wheel needs a newer driver than this node has
+   (`CUDA initialization: The NVIDIA driver on your system is too old
+   (found version 12080)`), leaving CUDA unavailable. 2.8.0 satisfies lerobot's
+   `torch>=2.7,<2.12` and sees the MIG slice.
+9. **lerobot CLI**: `--policy.push_to_hub=false` is required (the default True
+   demands a `repo_id` and fails `cfg.validate()`), and the eval cadence flag
+   is `--env_eval_freq`, not `--eval_freq`. torchcodec 0.11 is ABI-incompatible
+   with torch 2.8 and lerobot falls back to the `pyav` decoder on its own; this
+   is logged as a warning and needs no intervention.
+
+## II.5 Bugs found in the published code
+
+Not environment problems — defects in the repos as published, which had to be
+fixed for the code to run at all. All are in `third_party/` (untracked), and
+each is a minimal change, not a rewrite.
+
+1. **correct-n-contrast — `summarize_acc` return value misused (4 sites).**
+   `utils/logging.py:summarize_acc` returns a tuple `(average, worst_group)`,
+   but `evaluate.py:30`, `evaluate.py:88`, `train.py:103` and `train.py:141`
+   assign it to a scalar and then compare it against a float
+   (`args.max_robust_acc`, initialised to `-1`). Any run reaching an evaluation
+   pass dies with `TypeError: '>' not supported between instances of 'tuple'
+   and 'int'` — which is what killed the first CnC attempt after 12 minutes of
+   training. Fixed by unpacking both values at each site.
+2. **correct-n-contrast — two absolute paths from the authors' machine.**
+   `datasets/__init__.py` pointed `root_dir` at
+   `../slice-and-dice-smol/datasets/data/Waterbirds/` (the README's own
+   commented alternative was correct), and `resnet.py:13` loaded ImageNet
+   ResNet50 weights from
+   `/dfs/scratch1/mzhang/projects/.../resnet50-19c8e357.pth`. The second is
+   just torchvision's standard checkpoint, re-fetched from
+   `download.pytorch.org` and verified (267 keys, `fc` 1000×2048).
+3. **LfF — cross-device tensor indexing.** `train.py:251` builds
+   `aligned_mask`/`skewed_mask` on CUDA (from `attr`, moved to device at
+   line 178) and indexes `loss_per_sample_b` / `loss_weight`, which stay on
+   CPU. torch 1.4 tolerated this; torch 2.x raises
+   `RuntimeError: indices should be either on cpu or on the same device as the
+   indexed tensor`. The block is logging-only, so moving the masks to CPU
+   changes no training math.
+4. **nsf_debiasing — `train_sup.sh` is unsafe on a shared scheduler** (see
+   deviation 4 above) and passes `--label_filename` to `train_supervised.py`,
+   which has no such argument — it belongs to `ssc.py`'s parser.
